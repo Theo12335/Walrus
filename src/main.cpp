@@ -1,213 +1,185 @@
 /**
  * =============================================================================
- * PROJECT WALRUS - IoT Cloud Enabled (v3.0)
+ * PROJECT WALRUS - PRODUCTION API INTEGRATION (v6.0)
  * =============================================================================
- * - WiFi Connectivity (Local Hotspot/Pocket WiFi)
- * - Supabase Integration (JSON over HTTP POST)
- * - Ultrasonic Precision Refill
- * - TDS & Temp Monitoring
- * 
- * Target Hardware: ESP32-WROOM-32 (30-pin)
+ * Data Flow: ESP32 -> Vercel API (HTTPS) -> Supabase
+ * API Spec: production-v1 (device_id, sensors, actuators, state)
  * =============================================================================
  */
 
 #include <Arduino.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
+#include <WiFiClientSecure.h>
 #include <ArduinoJson.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
 
-// --- WiFi & CLOUD CONFIGURATION ---
-// Replace with your hotspot/pocket wifi credentials
-const char* ssid     = "YOUR_WIFI_NAME"; 
-const char* password = "YOUR_WIFI_PASS"; 
-
-// Supabase REST API Configuration
-// Format: https://[PROJECT_ID].supabase.co/rest/v1/[TABLE_NAME]
-const char* supabase_url = "https://your-project-id.supabase.co/rest/v1/sensor_logs";
-const char* supabase_key = "your-anon-key-here";
+// --- WiFi & API CONFIG ---
+const char *ssid = "YONG";
+const char *password = "GOODSHIT";
+const char *api_key = "walrus-esp32-key-2026"; // <-- Must match backend ESP32_API_KEY
+const char *device_id = "WALRUS_001";
+const char *backend_url = "https://walrus-pi.vercel.app/api/esp32/data";
 
 // --- PIN DEFINITIONS ---
-constexpr uint8_t PIN_DS18B20    = 4;
+constexpr uint8_t PIN_DS18B20 = 4;
 constexpr uint8_t PIN_TDS_ANALOG = 34;
 constexpr uint8_t PIN_ULTRA_TRIG = 19;
 constexpr uint8_t PIN_ULTRA_ECHO = 18;
 constexpr uint8_t PIN_RELAY_PUMP = 26;
 
-// --- LOGIC & CALIBRATION ---
-constexpr uint8_t RELAY_ON  = LOW;   // Active-LOW relay
-constexpr uint8_t RELAY_OFF = HIGH;
-constexpr float DIST_PUMP_ON_CM  = 7.5f; 
-constexpr float DIST_PUMP_OFF_CM = 6.5f;
+// --- GLOBAL STATE ---
+float currentTempC = 25.0;
+float currentDist = 0.0;
+int currentTds = 0;
+bool isPumpOn = false;
+unsigned long lastCloudSync = 0;
 
-// --- TIMING ---
-unsigned long lastSensorReadTime = 0;
-unsigned long lastCloudSendTime  = 0;
-const unsigned long SENSOR_INTERVAL_MS = 2000;   // Read sensors every 2s
-const unsigned long CLOUD_INTERVAL_MS  = 10000;  // Send to Cloud every 10s
-
-// --- GLOBAL OBJECTS ---
 OneWire oneWire(PIN_DS18B20);
 DallasTemperature sensors(&oneWire);
 
-// --- GLOBAL STATE ---
-float currentTempC = 25.0;
-float currentDist  = 0.0;
-int   currentTds   = 0;
-bool  isPumpOn     = false;
+// --- SENSOR LOGIC ---
+float getDistance()
+{
+    digitalWrite(PIN_ULTRA_TRIG, LOW);
+    delayMicroseconds(2);
+    digitalWrite(PIN_ULTRA_TRIG, HIGH);
+    delayMicroseconds(10);
+    digitalWrite(PIN_ULTRA_TRIG, LOW);
+    long dur = pulseIn(PIN_ULTRA_ECHO, HIGH, 30000);
+    return (dur == 0) ? 999.0f : (dur * 0.0343f) / 2.0f;
+}
 
-// --- FUNCTION PROTOTYPES ---
-void connectToWiFi();
-void updateSensors();
-void sendDataToSupabase();
-float getDistance();
+void updateSensors()
+{
+    sensors.requestTemperatures();
+    float t = sensors.getTempCByIndex(0);
+    if (t > -50 && t < 100)
+        currentTempC = t;
 
-// =============================================================================
-// SETUP
-// =============================================================================
-void setup() {
-    // 1. Boot Safety (Relay OFF)
+    currentDist = getDistance();
+
+    uint32_t analogVal = analogRead(PIN_TDS_ANALOG);
+    float v = (analogVal / 4095.0) * 3.3;
+    float raw = (133.42 * pow(v, 3) - 255.86 * pow(v, 2) + 857.39 * v) * 0.5;
+    currentTds = (int)(raw / (1.0 + 0.02 * (currentTempC - 25.0)));
+
+    // Pump Logic
+    if (currentDist > 50.0)
+    {
+        digitalWrite(PIN_RELAY_PUMP, HIGH);
+        isPumpOn = false;
+    }
+    else if (currentDist >= 7.5)
+    {
+        digitalWrite(PIN_RELAY_PUMP, LOW);
+        isPumpOn = true;
+    }
+    else if (currentDist <= 6.5)
+    {
+        digitalWrite(PIN_RELAY_PUMP, HIGH);
+        isPumpOn = false;
+    }
+}
+
+// --- CLOUD SYNC ---
+void syncWithProductionAPI()
+{
+    if (WiFi.status() != WL_CONNECTED)
+        return;
+
+    WiFiClientSecure *client = new WiFiClientSecure;
+    if (client)
+    {
+        client->setInsecure();
+
+        HTTPClient http;
+        if (http.begin(*client, backend_url))
+        {
+            http.addHeader("Content-Type", "application/json");
+            http.addHeader("X-API-Key", api_key);
+
+            // Construct Production JSON Body
+            JsonDocument doc;
+            doc["device_id"] = device_id;
+
+            JsonObject sensorsObj = doc["sensors"].to<JsonObject>();
+            sensorsObj["basin_temp"] = currentTempC;
+            sensorsObj["tds_ppm"] = currentTds;
+            sensorsObj["water_level_cm"] = currentDist;
+
+            JsonObject actuatorsObj = doc["actuators"].to<JsonObject>();
+            actuatorsObj["pump_active"] = isPumpOn;
+
+            // Determine System State
+            if (currentDist > 50.0)
+            {
+                doc["state"] = "Idle";
+            }
+            else if (isPumpOn)
+            {
+                doc["state"] = "Refilling";
+            }
+            String payload;
+            serializeJson(doc, payload);
+
+            Serial.println("[API] Syncing to Vercel Production:");
+            Serial.println(payload); // Print the actual JSON payload
+
+            int httpResponseCode = http.POST(payload);
+
+            if (httpResponseCode == 201)
+            {
+                Serial.println("Success (201 Created)");
+            }
+            else
+            {
+                Serial.printf("Error Code: %d\n", httpResponseCode);
+                if (httpResponseCode == 401 || httpResponseCode == 403)
+                {
+                    Serial.println("WARNING: Check your X-API-Key!");
+                }
+            }
+            http.end();
+        }
+        delete client;
+    }
+}
+
+void setup()
+{
     pinMode(PIN_RELAY_PUMP, OUTPUT);
-    digitalWrite(PIN_RELAY_PUMP, RELAY_OFF);
-    
-    Serial.begin(115200);
-    delay(1000);
-    Serial.println(F("\n--- PROJECT WALRUS: CLOUD MODE ---"));
+    digitalWrite(PIN_RELAY_PUMP, HIGH);
 
-    // 2. Hardware Init
+    Serial.begin(115200);
     pinMode(PIN_ULTRA_TRIG, OUTPUT);
     pinMode(PIN_ULTRA_ECHO, INPUT);
     sensors.begin();
-    analogReadResolution(12);
-    analogSetAttenuation(ADC_11db);
 
-    // 3. Connect to WiFi
-    connectToWiFi();
-}
-
-// =============================================================================
-// MAIN LOOP
-// =============================================================================
-void loop() {
-    unsigned long now = millis();
-
-    // Task 1: Sensor Readings & Local Control (2s)
-    if (now - lastSensorReadTime >= SENSOR_INTERVAL_MS) {
-        lastSensorReadTime = now;
-        updateSensors();
-        
-        // Local Telemetry
-        Serial.printf("T: %.1fC | D: %.1fcm | TDS: %d | Pump: %s\n", 
-                      currentTempC, currentDist, currentTds, isPumpOn ? "ON" : "OFF");
-    }
-
-    // Task 2: Cloud Sync (10s)
-    if (now - lastCloudSendTime >= CLOUD_INTERVAL_MS) {
-        lastCloudSendTime = now;
-        if (WiFi.status() == WL_CONNECTED) {
-            sendDataToSupabase();
-        } else {
-            Serial.println(F("[WIFI] Disconnected! Reconnecting..."));
-            WiFi.begin(ssid, password);
-        }
-    }
-}
-
-// =============================================================================
-// CORE FUNCTIONS
-// =============================================================================
-
-void connectToWiFi() {
-    Serial.print(F("[WIFI] Connecting to: "));
-    Serial.println(ssid);
-    
     WiFi.begin(ssid, password);
-    
-    // Timeout after 15 seconds if can't find hotspot
-    unsigned long startAttemptTime = millis();
-    while (WiFi.status() != WL_CONNECTED && millis() - startAttemptTime < 15000) {
+    Serial.print("Connecting to Internet");
+    while (WiFi.status() != WL_CONNECTED)
+    {
         delay(500);
         Serial.print(".");
     }
-
-    if (WiFi.status() == WL_CONNECTED) {
-        Serial.println(F("\n[WIFI] Connected!"));
-        Serial.print(F("[WIFI] IP: "));
-        Serial.println(WiFi.localIP());
-    } else {
-        Serial.println(F("\n[WIFI] Connection Failed (Proceeding in offline mode)"));
-    }
+    Serial.println("\nSystem Online.");
 }
 
-float getDistance() {
-    digitalWrite(PIN_ULTRA_TRIG, LOW); delayMicroseconds(2);
-    digitalWrite(PIN_ULTRA_TRIG, HIGH); delayMicroseconds(10);
-    digitalWrite(PIN_ULTRA_TRIG, LOW);
-    
-    long dur = pulseIn(PIN_ULTRA_ECHO, HIGH, 30000);
-    if (dur == 0) return 999.0f; // Timeout/Error
-    return (dur * 0.0343f) / 2.0f;
-}
-
-void updateSensors() {
-    // 1. Temp (DS18B20)
-    sensors.requestTemperatures();
-    float t = sensors.getTempCByIndex(0);
-    if (t > -50.0 && t < 100.0) currentTempC = t;
-    
-    // 2. Level (Ultrasonic)
-    currentDist = getDistance();
-    
-    // 3. TDS (Analog)
-    uint32_t analogVal = analogRead(PIN_TDS_ANALOG);
-    float v = (analogVal / 4095.0) * 3.3;
-    float raw = (133.42*pow(v,3) - 255.86*pow(v,2) + 857.39*v) * 0.5;
-    currentTds = (int)(raw / (1.0 + 0.02*(currentTempC - 25.0)));
-
-    // 4. Pump Control Logic
-    if (currentDist > 50.0) { // Safety Off (Sensor error or too far)
-        digitalWrite(PIN_RELAY_PUMP, RELAY_OFF);
-        isPumpOn = false;
-    } else if (currentDist >= DIST_PUMP_ON_CM) {
-        digitalWrite(PIN_RELAY_PUMP, RELAY_ON);
-        isPumpOn = true;
-    } else if (currentDist <= DIST_PUMP_OFF_CM) {
-        digitalWrite(PIN_RELAY_PUMP, RELAY_OFF);
-        isPumpOn = false;
-    }
-}
-
-void sendDataToSupabase() {
-    HTTPClient http;
-    
-    // Initialize JSON document
-    JsonDocument doc;
-    doc["temperature"] = currentTempC;
-    doc["tds"]         = currentTds;
-    doc["water_level"] = currentDist;
-    doc["pump_status"] = isPumpOn ? "ON" : "OFF";
-    
-    String jsonPayload;
-    serializeJson(doc, jsonPayload);
-
-    // Prepare HTTP Request
-    http.begin(supabase_url);
-    http.addHeader("Content-Type", "application/json");
-    http.addHeader("apikey", supabase_key);
-    http.addHeader("Authorization", String("Bearer ") + supabase_key);
-    http.addHeader("Prefer", "return=minimal"); // Save bandwidth
-
-    Serial.print(F("[CLOUD] Sending data to Supabase... "));
-    int httpResponseCode = http.POST(jsonPayload);
-
-    if (httpResponseCode > 0) {
-        Serial.print(F("Success! Code: "));
-        Serial.println(httpResponseCode);
-    } else {
-        Serial.print(F("Failed. Error: "));
-        Serial.println(http.errorToString(httpResponseCode).c_str());
+void loop()
+{
+    static unsigned long lastLocal = 0;
+    if (millis() - lastLocal >= 2000)
+    {
+        lastLocal = millis();
+        updateSensors();
+        Serial.printf("T:%.1f D:%.1f TDS:%d P:%s\n", currentTempC, currentDist, currentTds, isPumpOn ? "ON" : "OFF");
     }
 
-    http.end();
+    if (millis() - lastCloudSync >= 15000)
+    {
+        lastCloudSync = millis();
+        syncWithProductionAPI();
+    }
 }
