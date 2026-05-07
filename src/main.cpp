@@ -55,6 +55,11 @@ bool  isMistOn           = false;
 bool  floatWaterDetected = false;
 unsigned long lastCloudSync = 0;
 
+// --- OVERRIDE STATE (set by mobile app via API response) ---
+String overrideIntakePump  = "auto"; // "auto" | "on" | "off"
+String overrideCollectPump = "auto";
+String overrideMist        = "auto";
+
 OneWire oneWire(PIN_DS18B20);
 DallasTemperature sensors(&oneWire);
 
@@ -125,34 +130,57 @@ void updateSensors() {
     float raw = (133.42f * pow(v, 3) - 255.86f * pow(v, 2) + 857.39f * v) * 0.5f;
     currentTds = (int)(raw / (1.0f + 0.02f * (currentTempC - 25.0f)));
 
-    // Float switch → controls intake pump
-    // LOW = water detected (INPUT_PULLUP + switch closes to GND)
+    // Float switch → controls intake pump (unless overridden)
     floatWaterDetected = (digitalRead(PIN_FLOAT_SWITCH) == LOW);
-    if (!floatWaterDetected) {
-        digitalWrite(PIN_RELAY_PUMP_INTAKE, LOW);  // no water → intake ON
+    if (overrideIntakePump == "on") {
+        digitalWrite(PIN_RELAY_PUMP_INTAKE, LOW);
         isIntakePumpOn = true;
-    } else {
-        digitalWrite(PIN_RELAY_PUMP_INTAKE, HIGH); // water detected → intake OFF
+    } else if (overrideIntakePump == "off") {
+        digitalWrite(PIN_RELAY_PUMP_INTAKE, HIGH);
         isIntakePumpOn = false;
-    }
-
-    // Ultrasonic → controls collection pump
-    bool cleanWaterPresent = (currentCleanDist <= CLEAN_WATER_THRESHOLD);
-    if (cleanWaterPresent) {
-        digitalWrite(PIN_RELAY_PUMP_COLLECT, LOW);  // clean water ready → collect
-        isCollectPumpOn = true;
     } else {
-        digitalWrite(PIN_RELAY_PUMP_COLLECT, HIGH); // nothing to collect → OFF
-        isCollectPumpOn = false;
+        if (!floatWaterDetected) {
+            digitalWrite(PIN_RELAY_PUMP_INTAKE, LOW);
+            isIntakePumpOn = true;
+        } else {
+            digitalWrite(PIN_RELAY_PUMP_INTAKE, HIGH);
+            isIntakePumpOn = false;
+        }
     }
 
-    // Mist/atomizer — ON when temp >= 30°C, OFF below 28°C
-    if (currentTempC >= 30.0f && !isMistOn) {
+    // Ultrasonic → controls collection pump (unless overridden)
+    bool cleanWaterPresent = (currentCleanDist <= CLEAN_WATER_THRESHOLD);
+    if (overrideCollectPump == "on") {
+        digitalWrite(PIN_RELAY_PUMP_COLLECT, LOW);
+        isCollectPumpOn = true;
+    } else if (overrideCollectPump == "off") {
+        digitalWrite(PIN_RELAY_PUMP_COLLECT, HIGH);
+        isCollectPumpOn = false;
+    } else {
+        if (cleanWaterPresent) {
+            digitalWrite(PIN_RELAY_PUMP_COLLECT, LOW);
+            isCollectPumpOn = true;
+        } else {
+            digitalWrite(PIN_RELAY_PUMP_COLLECT, HIGH);
+            isCollectPumpOn = false;
+        }
+    }
+
+    // Mist/atomizer (unless overridden)
+    if (overrideMist == "on") {
         digitalWrite(PIN_RELAY_MIST, LOW);
         isMistOn = true;
-    } else if (currentTempC < 28.0f && isMistOn) {
+    } else if (overrideMist == "off") {
         digitalWrite(PIN_RELAY_MIST, HIGH);
         isMistOn = false;
+    } else {
+        if (currentTempC >= 30.0f && !isMistOn) {
+            digitalWrite(PIN_RELAY_MIST, LOW);
+            isMistOn = true;
+        } else if (currentTempC < 28.0f && isMistOn) {
+            digitalWrite(PIN_RELAY_MIST, HIGH);
+            isMistOn = false;
+        }
     }
 }
 
@@ -201,17 +229,28 @@ void syncWithProductionAPI() {
                 Serial.println("WARNING: Check your X-API-Key!");
         }
 
-        // Check response body for sleep command from the mobile app
+        // Parse response for commands from mobile app
         String responseBody = http.getString();
         JsonDocument resDoc;
         if (deserializeJson(resDoc, responseBody) == DeserializationError::Ok) {
             if (resDoc["sleep"] | false) {
-                Serial.println("[APP] Sleep command received from app.");
+                Serial.println("[APP] Sleep command received.");
                 http.end();
                 delete client;
                 enterDeepSleep();
                 return;
             }
+            if (resDoc["commands"]["intake_pump_override"].is<const char*>())
+                overrideIntakePump  = resDoc["commands"]["intake_pump_override"].as<String>();
+            if (resDoc["commands"]["collect_pump_override"].is<const char*>())
+                overrideCollectPump = resDoc["commands"]["collect_pump_override"].as<String>();
+            if (resDoc["commands"]["mist_override"].is<const char*>())
+                overrideMist        = resDoc["commands"]["mist_override"].as<String>();
+
+            Serial.printf("[CMD] Overrides — IN:%s COL:%s MIST:%s\n",
+                overrideIntakePump.c_str(),
+                overrideCollectPump.c_str(),
+                overrideMist.c_str());
         }
 
         http.end();
