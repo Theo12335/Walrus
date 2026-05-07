@@ -233,13 +233,6 @@ void syncWithProductionAPI() {
         String responseBody = http.getString();
         JsonDocument resDoc;
         if (deserializeJson(resDoc, responseBody) == DeserializationError::Ok) {
-            if (resDoc["sleep"] | false) {
-                Serial.println("[APP] Sleep command received.");
-                http.end();
-                delete client;
-                enterDeepSleep();
-                return;
-            }
             if (resDoc["commands"]["intake_pump_override"].is<const char*>())
                 overrideIntakePump  = resDoc["commands"]["intake_pump_override"].as<String>();
             if (resDoc["commands"]["collect_pump_override"].is<const char*>())
@@ -285,33 +278,9 @@ void setup() {
     }
     Serial.println("\nSystem Online.");
 
-    // Sync time via NTP
-    configTime(gmt_offset, dst_offset, ntp_server);
-    Serial.print("Syncing time");
-    struct tm timeinfo;
-    while (!getLocalTime(&timeinfo)) {
-        delay(500);
-        Serial.print(".");
-    }
-    Serial.printf("\nTime: %02d:%02d\n", timeinfo.tm_hour, timeinfo.tm_min);
-
-    // Sleep immediately if booting during night hours
-    if (timeinfo.tm_hour >= SLEEP_HOUR || timeinfo.tm_hour < WAKE_HOUR) {
-        Serial.println("[SLEEP] Night time on boot — sleeping.");
-        enterDeepSleep();
-    }
 }
 
 void loop() {
-    // Night-time sleep check every cycle
-    struct tm timeinfo;
-    if (getLocalTime(&timeinfo)) {
-        if (timeinfo.tm_hour >= SLEEP_HOUR || timeinfo.tm_hour < WAKE_HOUR) {
-            Serial.println("[SLEEP] Night time — sleeping.");
-            enterDeepSleep();
-        }
-    }
-
     static unsigned long lastLocal = 0;
     if (millis() - lastLocal >= 2000) {
         lastLocal = millis();
