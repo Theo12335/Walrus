@@ -60,7 +60,10 @@ bool  floatWaterDetected = false;
 String overrideIntakePump  = "auto";
 String overrideCollectPump = "auto";
 String overrideMist        = "auto";
-String overrideHeater      = "auto";
+// Heater is auto-only (local thermostat). Not exposed to the API.
+
+// --- SLEEP STATE (from app via response.sleep) ---
+bool isSleeping = false;
 
 // --- TEMP SENSOR STATE ---
 bool tempRequested        = false;
@@ -101,8 +104,20 @@ void updateFastSensors() {
     float raw = (133.42f * pow(v, 3) - 255.86f * pow(v, 2) + 857.39f * v) * 0.5f;
     currentTds = (int)(raw / (1.0f + 0.02f * (currentTempC - 25.0f)));
 
-    // Float switch → intake pump
+    // Float switch (always read — it's a sensor)
     floatWaterDetected = (digitalRead(PIN_FLOAT_SWITCH) == LOW);
+
+    // SLEEP MODE: app told the device to power down — kill all relays, skip auto logic.
+    // Heater stays off too (active LOW relay → HIGH = off).
+    if (isSleeping) {
+        digitalWrite(PIN_RELAY_PUMP_INTAKE,  HIGH);
+        digitalWrite(PIN_RELAY_PUMP_COLLECT, HIGH);
+        digitalWrite(PIN_RELAY_MIST,         HIGH);
+        digitalWrite(PIN_RELAY_HEATER,       HIGH);
+        isIntakePumpOn = isCollectPumpOn = isMistOn = isHeaterOn = false;
+        return;
+    }
+    // Intake pump — driven by float switch in auto, can be overridden from app
     if (overrideIntakePump == "on") {
         digitalWrite(PIN_RELAY_PUMP_INTAKE, LOW);
         isIntakePumpOn = true;
@@ -145,21 +160,14 @@ void updateFastSensors() {
         }
     }
 
-    // PTC Heater — ON below 25°C, OFF above 28°C
-    if (overrideHeater == "on") {
+    // PTC Heater — auto-only thermostat (not exposed to the API).
+    // ON below 25°C, OFF above 28°C to keep the basin from freezing.
+    if (currentTempC < HEATER_ON_TEMP && !isHeaterOn) {
         digitalWrite(PIN_RELAY_HEATER, LOW);
         isHeaterOn = true;
-    } else if (overrideHeater == "off") {
+    } else if (currentTempC >= HEATER_OFF_TEMP && isHeaterOn) {
         digitalWrite(PIN_RELAY_HEATER, HIGH);
         isHeaterOn = false;
-    } else {
-        if (currentTempC < HEATER_ON_TEMP && !isHeaterOn) {
-            digitalWrite(PIN_RELAY_HEATER, LOW);
-            isHeaterOn = true;
-        } else if (currentTempC >= HEATER_OFF_TEMP && isHeaterOn) {
-            digitalWrite(PIN_RELAY_HEATER, HIGH);
-            isHeaterOn = false;
-        }
     }
 }
 
@@ -179,22 +187,26 @@ void syncWithProductionAPI() {
         JsonDocument doc;
         doc["device_id"] = device_id;
 
+        // float_water_detect belongs in sensors per the WALRUS Pydantic SensorData model.
+        // heater_active is intentionally omitted — the heater is a local auto-only thermostat.
         JsonObject sensorsObj = doc["sensors"].to<JsonObject>();
-        sensorsObj["basin_temp"]     = currentTempC;
-        sensorsObj["tds_ppm"]        = currentTds;
-        sensorsObj["clean_level_cm"] = currentCleanDist;
+        sensorsObj["basin_temp"]         = currentTempC;
+        sensorsObj["tds_ppm"]            = currentTds;
+        sensorsObj["clean_level_cm"]     = currentCleanDist;
+        sensorsObj["float_water_detect"] = floatWaterDetected;
 
         JsonObject actuatorsObj = doc["actuators"].to<JsonObject>();
         actuatorsObj["intake_pump_active"]  = isIntakePumpOn;
         actuatorsObj["collect_pump_active"] = isCollectPumpOn;
         actuatorsObj["mist_active"]         = isMistOn;
-        actuatorsObj["heater_active"]       = isHeaterOn;
-        actuatorsObj["float_water_detect"]  = floatWaterDetected;
 
-        if (isIntakePumpOn)       doc["state"] = "Intake";
-        else if (isCollectPumpOn) doc["state"] = "Collecting";
-        else if (isHeaterOn)      doc["state"] = "Heating";
-        else                      doc["state"] = "Monitoring";
+        // State strings match the WALRUS StatusBadge / deviceStatus vocab.
+        // Priority: Sleeping → Distilling (mist) → Collecting → Refilling → Monitoring.
+        if (isSleeping)                doc["state"] = "Sleeping";
+        else if (isMistOn)             doc["state"] = "Distilling";
+        else if (isCollectPumpOn)      doc["state"] = "Collecting";
+        else if (isIntakePumpOn)       doc["state"] = "Refilling";
+        else                           doc["state"] = "Monitoring";
 
         String payload;
         serializeJson(doc, payload);
@@ -210,24 +222,26 @@ void syncWithProductionAPI() {
                 Serial.println("WARNING: Check X-API-Key!");
         }
 
-        // Parse commands from app
+        // Parse commands from the app. Response shape (per WALRUS contract):
+        //   { sleep: bool, commands: { intake_pump_override, collect_pump_override, mist_override } }
         String responseBody = http.getString();
         JsonDocument resDoc;
         if (deserializeJson(resDoc, responseBody) == DeserializationError::Ok) {
+            if (resDoc["sleep"].is<bool>())
+                isSleeping = resDoc["sleep"].as<bool>();
+
             if (resDoc["commands"]["intake_pump_override"].is<const char*>())
                 overrideIntakePump  = resDoc["commands"]["intake_pump_override"].as<String>();
             if (resDoc["commands"]["collect_pump_override"].is<const char*>())
                 overrideCollectPump = resDoc["commands"]["collect_pump_override"].as<String>();
             if (resDoc["commands"]["mist_override"].is<const char*>())
                 overrideMist        = resDoc["commands"]["mist_override"].as<String>();
-            if (resDoc["commands"]["heater_override"].is<const char*>())
-                overrideHeater      = resDoc["commands"]["heater_override"].as<String>();
 
-            Serial.printf("[CMD] IN:%s COL:%s MIST:%s HEAT:%s\n",
+            Serial.printf("[CMD] sleep:%s IN:%s COL:%s MIST:%s\n",
+                isSleeping ? "ON" : "OFF",
                 overrideIntakePump.c_str(),
                 overrideCollectPump.c_str(),
-                overrideMist.c_str(),
-                overrideHeater.c_str());
+                overrideMist.c_str());
         }
 
         http.end();
@@ -288,13 +302,14 @@ void loop() {
     if (now - lastFast >= FAST_INTERVAL) {
         lastFast = now;
         updateFastSensors();
-        Serial.printf("T:%.1f CLEAN:%.1f TDS:%d IN:%s COL:%s MIST:%s HEAT:%s FLOAT:%s\n",
+        Serial.printf("T:%.1f CLEAN:%.1f TDS:%d IN:%s COL:%s MIST:%s HEAT:%s FLOAT:%s SLEEP:%s\n",
             currentTempC, currentCleanDist, currentTds,
             isIntakePumpOn  ? "ON" : "OFF",
             isCollectPumpOn ? "ON" : "OFF",
             isMistOn        ? "ON" : "OFF",
             isHeaterOn      ? "ON" : "OFF",
-            floatWaterDetected ? "YES" : "NO");
+            floatWaterDetected ? "YES" : "NO",
+            isSleeping ? "YES" : "NO");
         syncWithProductionAPI();
     }
 }
