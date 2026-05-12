@@ -30,6 +30,7 @@ CREATE TABLE sensor_readings (
     intake_pump_active  BOOLEAN DEFAULT FALSE,
     collect_pump_active BOOLEAN DEFAULT FALSE,
     mist_active         BOOLEAN DEFAULT FALSE,
+    heater_active       BOOLEAN DEFAULT FALSE,
     float_water_detect  BOOLEAN DEFAULT FALSE,
     state               TEXT,
     created_at          TIMESTAMPTZ DEFAULT NOW()
@@ -53,6 +54,7 @@ CREATE TABLE device_commands (
     intake_pump_override  TEXT DEFAULT 'auto',
     collect_pump_override TEXT DEFAULT 'auto',
     mist_override         TEXT DEFAULT 'auto',
+    heater_override       TEXT DEFAULT 'auto',
     updated_at            TIMESTAMPTZ DEFAULT NOW()
 );
 

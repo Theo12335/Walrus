@@ -1,6 +1,6 @@
 /**
  * =============================================================================
- * PROJECT WALRUS - PRODUCTION API INTEGRATION (v7.0)
+ * PROJECT WALRUS - PRODUCTION API INTEGRATION (v8.0)
  * =============================================================================
  * Data Flow: ESP32 -> Vercel API (HTTPS) -> Supabase
  * API Spec: production-v1 (device_id, sensors, actuators, state)
@@ -14,7 +14,6 @@
 #include <ArduinoJson.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
-#include <time.h>
 
 // --- WiFi & API CONFIG ---
 const char *ssid        = "Wassup2.4G";
@@ -23,27 +22,29 @@ const char *api_key     = "walrus-esp32-key-2026";
 const char *device_id   = "WALRUS_001";
 const char *backend_url = "https://walrus-pi.vercel.app/api/esp32/data";
 
-// --- NTP (Philippines UTC+8) ---
-const char *ntp_server = "pool.ntp.org";
-const long  gmt_offset = 8 * 3600;
-const int   dst_offset = 0;
+// --- SLEEP SCHEDULE (disabled for testing) ---
+constexpr int SLEEP_HOUR = 20;
+constexpr int WAKE_HOUR  = 6;
 
-// --- SLEEP SCHEDULE ---
-constexpr int SLEEP_HOUR = 20; // 8 PM — system sleeps
-constexpr int WAKE_HOUR  = 6;  // 6 AM — system wakes
+// --- TIMING ---
+constexpr unsigned long FAST_INTERVAL = 500;  // float, ultrasonic, TDS, pumps, API sync
+constexpr unsigned long TEMP_INTERVAL = 5000; // DS18B20 (non-blocking)
+constexpr unsigned long TEMP_WAIT_MS  = 800;  // wait after requestTemperatures()
 
 // --- PIN DEFINITIONS ---
-constexpr uint8_t PIN_DS18B20            = 4;
+constexpr uint8_t PIN_DS18B20            = 22;
 constexpr uint8_t PIN_TDS_ANALOG         = 34;
-constexpr uint8_t PIN_ULTRA_TRIG         = 19; // clean water output level
-constexpr uint8_t PIN_ULTRA_ECHO         = 18;
-constexpr uint8_t PIN_RELAY_PUMP_INTAKE  = 26; // IN1 — intake pump
-constexpr uint8_t PIN_RELAY_PUMP_COLLECT = 27; // IN2 — collection pump
-constexpr uint8_t PIN_RELAY_MIST         = 32; // IN3 — atomizer/mist
-constexpr uint8_t PIN_FLOAT_SWITCH       = 33; // 2-wire ball float switch
+constexpr uint8_t PIN_ULTRA_TRIG         = 19;
+constexpr uint8_t PIN_ULTRA_ECHO         = 21;
+constexpr uint8_t PIN_RELAY_PUMP_INTAKE  = 26; // IN1
+constexpr uint8_t PIN_RELAY_PUMP_COLLECT = 27; // IN2
+constexpr uint8_t PIN_RELAY_MIST         = 25; // IN4 — atomizer/mist
+constexpr uint8_t PIN_RELAY_HEATER       = 32; // IN3 — 12V PTC heater
+constexpr uint8_t PIN_FLOAT_SWITCH       = 33;
 
-// Clean water present if ultrasonic reads <= this distance (cm)
 constexpr float CLEAN_WATER_THRESHOLD = 20.0f;
+constexpr float HEATER_ON_TEMP        = 25.0f; // turn ON below this °C
+constexpr float HEATER_OFF_TEMP       = 28.0f; // turn OFF above this °C
 
 // --- GLOBAL STATE ---
 float currentTempC     = 25.0;
@@ -52,76 +53,46 @@ int   currentTds       = 0;
 bool  isIntakePumpOn     = false;
 bool  isCollectPumpOn    = false;
 bool  isMistOn           = false;
+bool  isHeaterOn         = false;
 bool  floatWaterDetected = false;
-unsigned long lastCloudSync = 0;
 
-// --- OVERRIDE STATE (set by mobile app via API response) ---
-String overrideIntakePump  = "auto"; // "auto" | "on" | "off"
+// --- OVERRIDE STATE ---
+String overrideIntakePump  = "auto";
 String overrideCollectPump = "auto";
 String overrideMist        = "auto";
+String overrideHeater      = "auto";
+
+// --- TEMP SENSOR STATE ---
+bool tempRequested        = false;
+unsigned long tempRequestTime = 0;
 
 OneWire oneWire(PIN_DS18B20);
 DallasTemperature sensors(&oneWire);
 
-// --- DEEP SLEEP ---
-void enterDeepSleep() {
-    // Turn everything off before sleeping
-    digitalWrite(PIN_RELAY_PUMP_INTAKE, HIGH);
-    digitalWrite(PIN_RELAY_PUMP_COLLECT, HIGH);
-    digitalWrite(PIN_RELAY_MIST, HIGH);
-
-    struct tm timeinfo;
-    uint64_t sleepSeconds = 8ULL * 3600; // fallback: 8 hours
-
-    if (getLocalTime(&timeinfo)) {
-        int secondsNow  = timeinfo.tm_hour * 3600 + timeinfo.tm_min * 60 + timeinfo.tm_sec;
-        int wakeSeconds = WAKE_HOUR * 3600;
-        sleepSeconds = (secondsNow < wakeSeconds)
-            ? (uint64_t)(wakeSeconds - secondsNow)
-            : (uint64_t)(24 * 3600 - secondsNow + wakeSeconds);
-    }
-
-    Serial.printf("[SLEEP] Sleeping for %llu s — waking at %02d:00\n", sleepSeconds, WAKE_HOUR);
-    Serial.flush();
-    esp_sleep_enable_timer_wakeup(sleepSeconds * 1000000ULL);
-    esp_deep_sleep_start();
-}
-
-// --- SENSOR LOGIC ---
+// --- ULTRASONIC ---
 float getDistance(uint8_t trig, uint8_t echo) {
-    const int samples = 5;
-    float readings[samples];
+    const int samples = 3;
+    float sum = 0;
     int valid = 0;
-
     for (int i = 0; i < samples; i++) {
         digitalWrite(trig, LOW);
         delayMicroseconds(2);
         digitalWrite(trig, HIGH);
         delayMicroseconds(10);
         digitalWrite(trig, LOW);
-        long dur = pulseIn(echo, HIGH, 30000);
+        long dur = pulseIn(echo, HIGH, 25000);
         if (dur > 0) {
-            readings[valid++] = (dur * 0.0343f) / 2.0f;
+            sum += (dur * 0.0343f) / 2.0f;
+            valid++;
         }
         delay(10);
     }
-
-    if (valid == 0) return 999.0f;
-
-    // return average of valid readings
-    float sum = 0;
-    for (int i = 0; i < valid; i++) sum += readings[i];
-    return sum / valid;
+    return (valid == 0) ? 999.0f : sum / valid;
 }
 
-void updateSensors() {
-    // Temperature
-    sensors.requestTemperatures();
-    float t = sensors.getTempCByIndex(0);
-    Serial.printf("[DS18B20] Raw: %.1f\n", t);
-    if (t > -50 && t < 100) currentTempC = t;
-
-    // Ultrasonic — clean water output level
+// --- FAST SENSORS & ACTUATOR CONTROL ---
+void updateFastSensors() {
+    // Ultrasonic
     currentCleanDist = getDistance(PIN_ULTRA_TRIG, PIN_ULTRA_ECHO);
 
     // TDS
@@ -130,7 +101,7 @@ void updateSensors() {
     float raw = (133.42f * pow(v, 3) - 255.86f * pow(v, 2) + 857.39f * v) * 0.5f;
     currentTds = (int)(raw / (1.0f + 0.02f * (currentTempC - 25.0f)));
 
-    // Float switch → controls intake pump (unless overridden)
+    // Float switch → intake pump
     floatWaterDetected = (digitalRead(PIN_FLOAT_SWITCH) == LOW);
     if (overrideIntakePump == "on") {
         digitalWrite(PIN_RELAY_PUMP_INTAKE, LOW);
@@ -139,16 +110,12 @@ void updateSensors() {
         digitalWrite(PIN_RELAY_PUMP_INTAKE, HIGH);
         isIntakePumpOn = false;
     } else {
-        if (!floatWaterDetected) {
-            digitalWrite(PIN_RELAY_PUMP_INTAKE, LOW);
-            isIntakePumpOn = true;
-        } else {
-            digitalWrite(PIN_RELAY_PUMP_INTAKE, HIGH);
-            isIntakePumpOn = false;
-        }
+        bool on = !floatWaterDetected;
+        digitalWrite(PIN_RELAY_PUMP_INTAKE, on ? LOW : HIGH);
+        isIntakePumpOn = on;
     }
 
-    // Ultrasonic → controls collection pump (unless overridden)
+    // Ultrasonic → collection pump
     bool cleanWaterPresent = (currentCleanDist <= CLEAN_WATER_THRESHOLD);
     if (overrideCollectPump == "on") {
         digitalWrite(PIN_RELAY_PUMP_COLLECT, LOW);
@@ -157,16 +124,11 @@ void updateSensors() {
         digitalWrite(PIN_RELAY_PUMP_COLLECT, HIGH);
         isCollectPumpOn = false;
     } else {
-        if (cleanWaterPresent) {
-            digitalWrite(PIN_RELAY_PUMP_COLLECT, LOW);
-            isCollectPumpOn = true;
-        } else {
-            digitalWrite(PIN_RELAY_PUMP_COLLECT, HIGH);
-            isCollectPumpOn = false;
-        }
+        digitalWrite(PIN_RELAY_PUMP_COLLECT, cleanWaterPresent ? LOW : HIGH);
+        isCollectPumpOn = cleanWaterPresent;
     }
 
-    // Mist/atomizer (unless overridden)
+    // Mist — ON >= 30°C, OFF < 28°C
     if (overrideMist == "on") {
         digitalWrite(PIN_RELAY_MIST, LOW);
         isMistOn = true;
@@ -180,6 +142,23 @@ void updateSensors() {
         } else if (currentTempC < 28.0f && isMistOn) {
             digitalWrite(PIN_RELAY_MIST, HIGH);
             isMistOn = false;
+        }
+    }
+
+    // PTC Heater — ON below 25°C, OFF above 28°C
+    if (overrideHeater == "on") {
+        digitalWrite(PIN_RELAY_HEATER, LOW);
+        isHeaterOn = true;
+    } else if (overrideHeater == "off") {
+        digitalWrite(PIN_RELAY_HEATER, HIGH);
+        isHeaterOn = false;
+    } else {
+        if (currentTempC < HEATER_ON_TEMP && !isHeaterOn) {
+            digitalWrite(PIN_RELAY_HEATER, LOW);
+            isHeaterOn = true;
+        } else if (currentTempC >= HEATER_OFF_TEMP && isHeaterOn) {
+            digitalWrite(PIN_RELAY_HEATER, HIGH);
+            isHeaterOn = false;
         }
     }
 }
@@ -209,27 +188,29 @@ void syncWithProductionAPI() {
         actuatorsObj["intake_pump_active"]  = isIntakePumpOn;
         actuatorsObj["collect_pump_active"] = isCollectPumpOn;
         actuatorsObj["mist_active"]         = isMistOn;
+        actuatorsObj["heater_active"]       = isHeaterOn;
         actuatorsObj["float_water_detect"]  = floatWaterDetected;
 
-        if (isIntakePumpOn)        doc["state"] = "Intake";
-        else if (isCollectPumpOn)  doc["state"] = "Collecting";
-        else                       doc["state"] = "Monitoring";
+        if (isIntakePumpOn)       doc["state"] = "Intake";
+        else if (isCollectPumpOn) doc["state"] = "Collecting";
+        else if (isHeaterOn)      doc["state"] = "Heating";
+        else                      doc["state"] = "Monitoring";
 
         String payload;
         serializeJson(doc, payload);
-        Serial.println("[API] Syncing to Vercel:");
+        Serial.println("[API] Syncing:");
         Serial.println(payload);
 
         int code = http.POST(payload);
         if (code == 201) {
-            Serial.println("Success (201 Created)");
+            Serial.println("Success (201)");
         } else {
-            Serial.printf("Error Code: %d\n", code);
+            Serial.printf("Error: %d\n", code);
             if (code == 401 || code == 403)
-                Serial.println("WARNING: Check your X-API-Key!");
+                Serial.println("WARNING: Check X-API-Key!");
         }
 
-        // Parse response for commands from mobile app
+        // Parse commands from app
         String responseBody = http.getString();
         JsonDocument resDoc;
         if (deserializeJson(resDoc, responseBody) == DeserializationError::Ok) {
@@ -239,11 +220,14 @@ void syncWithProductionAPI() {
                 overrideCollectPump = resDoc["commands"]["collect_pump_override"].as<String>();
             if (resDoc["commands"]["mist_override"].is<const char*>())
                 overrideMist        = resDoc["commands"]["mist_override"].as<String>();
+            if (resDoc["commands"]["heater_override"].is<const char*>())
+                overrideHeater      = resDoc["commands"]["heater_override"].as<String>();
 
-            Serial.printf("[CMD] Overrides — IN:%s COL:%s MIST:%s\n",
+            Serial.printf("[CMD] IN:%s COL:%s MIST:%s HEAT:%s\n",
                 overrideIntakePump.c_str(),
                 overrideCollectPump.c_str(),
-                overrideMist.c_str());
+                overrideMist.c_str(),
+                overrideHeater.c_str());
         }
 
         http.end();
@@ -252,7 +236,6 @@ void syncWithProductionAPI() {
 }
 
 void setup() {
-    // Relay pins — HIGH = OFF (active-low relay)
     pinMode(PIN_RELAY_PUMP_INTAKE, OUTPUT);
     digitalWrite(PIN_RELAY_PUMP_INTAKE, HIGH);
 
@@ -262,39 +245,56 @@ void setup() {
     pinMode(PIN_RELAY_MIST, OUTPUT);
     digitalWrite(PIN_RELAY_MIST, HIGH);
 
-    pinMode(PIN_FLOAT_SWITCH, INPUT_PULLUP);
+    pinMode(PIN_RELAY_HEATER, OUTPUT);
+    digitalWrite(PIN_RELAY_HEATER, HIGH); // heater OFF on boot
 
+    pinMode(PIN_FLOAT_SWITCH, INPUT_PULLUP);
     pinMode(PIN_ULTRA_TRIG, OUTPUT);
     pinMode(PIN_ULTRA_ECHO, INPUT);
 
     Serial.begin(115200);
     sensors.begin();
+    sensors.setWaitForConversion(false);
 
     WiFi.begin(ssid, password);
-    Serial.print("Connecting to Internet");
+    Serial.print("Connecting");
     while (WiFi.status() != WL_CONNECTED) {
         delay(500);
         Serial.print(".");
     }
     Serial.println("\nSystem Online.");
-
 }
 
 void loop() {
-    static unsigned long lastLocal = 0;
-    if (millis() - lastLocal >= 2000) {
-        lastLocal = millis();
-        updateSensors();
-        Serial.printf("T:%.1f CLEAN:%.1f TDS:%d IN:%s COL:%s MIST:%s FLOAT:%s\n",
+    unsigned long now = millis();
+
+    // --- SLOW: DS18B20 temperature (non-blocking, every 5s) ---
+    static unsigned long lastTempRequest = 0;
+    if (!tempRequested && (now - lastTempRequest >= TEMP_INTERVAL)) {
+        sensors.requestTemperatures();
+        tempRequested   = true;
+        tempRequestTime = now;
+        lastTempRequest = now;
+    }
+    if (tempRequested && (now - tempRequestTime >= TEMP_WAIT_MS)) {
+        float t = sensors.getTempCByIndex(0);
+        Serial.printf("[DS18B20] %.1f C\n", t);
+        if (t > -50 && t < 100) currentTempC = t;
+        tempRequested = false;
+    }
+
+    // --- FAST: sensors, actuators, API sync (every 500ms) ---
+    static unsigned long lastFast = 0;
+    if (now - lastFast >= FAST_INTERVAL) {
+        lastFast = now;
+        updateFastSensors();
+        Serial.printf("T:%.1f CLEAN:%.1f TDS:%d IN:%s COL:%s MIST:%s HEAT:%s FLOAT:%s\n",
             currentTempC, currentCleanDist, currentTds,
             isIntakePumpOn  ? "ON" : "OFF",
             isCollectPumpOn ? "ON" : "OFF",
             isMistOn        ? "ON" : "OFF",
+            isHeaterOn      ? "ON" : "OFF",
             floatWaterDetected ? "YES" : "NO");
-    }
-
-    if (millis() - lastCloudSync >= 15000) {
-        lastCloudSync = millis();
         syncWithProductionAPI();
     }
 }
