@@ -39,15 +39,12 @@ constexpr uint8_t PIN_ULTRA_ECHO         = 21;
 constexpr uint8_t PIN_RELAY_PUMP_INTAKE  = 26; // IN1
 constexpr uint8_t PIN_RELAY_PUMP_COLLECT = 27; // IN2
 constexpr uint8_t PIN_RELAY_MIST         = 25; // IN4 — atomizer/mist
-constexpr uint8_t PIN_RELAY_HEATER       = 32; // IN3 — 12V PTC heater
-constexpr uint8_t PIN_RELAY_PELTIER      = 23; // Peltier module (basin heat-up)
+constexpr uint8_t PIN_RELAY_PELTIER      = 32; // IN3 — Peltier module (basin heat-up)
 constexpr uint8_t PIN_FLOAT_SWITCH       = 33;
 
 constexpr float CLEAN_WATER_THRESHOLD = 20.0f;
-constexpr float HEATER_ON_TEMP        = 25.0f; // PTC: turn ON below this °C
-constexpr float HEATER_OFF_TEMP       = 28.0f; // PTC: turn OFF above this °C
-constexpr float PELTIER_ON_TEMP       = 30.0f; // Peltier: drive basin toward distillation temp
-constexpr float PELTIER_OFF_TEMP      = 33.0f; // Peltier: stop heating once warm enough
+constexpr float PELTIER_ON_TEMP       = 30.0f; // ON below this °C — drive basin toward distillation
+constexpr float PELTIER_OFF_TEMP      = 33.0f; // OFF above this °C — stop heating once warm enough
 
 // --- GLOBAL STATE ---
 float currentTempC     = 25.0;
@@ -56,7 +53,6 @@ int   currentTds       = 0;
 bool  isIntakePumpOn     = false;
 bool  isCollectPumpOn    = false;
 bool  isMistOn           = false;
-bool  isHeaterOn         = false;
 bool  isPeltierOn        = false;
 bool  floatWaterDetected = false;
 
@@ -65,7 +61,6 @@ String overrideIntakePump  = "auto";
 String overrideCollectPump = "auto";
 String overrideMist        = "auto";
 String overridePeltier     = "auto";
-// PTC Heater is auto-only (local thermostat). Not exposed to the API.
 
 // --- SLEEP STATE (from app via response.sleep) ---
 bool isSleeping = false;
@@ -113,14 +108,13 @@ void updateFastSensors() {
     floatWaterDetected = (digitalRead(PIN_FLOAT_SWITCH) == LOW);
 
     // SLEEP MODE: app told the device to power down — kill all relays, skip auto logic.
-    // Heater & Peltier stay off too (active LOW relay → HIGH = off).
+    // Active LOW relay → HIGH = off.
     if (isSleeping) {
         digitalWrite(PIN_RELAY_PUMP_INTAKE,  HIGH);
         digitalWrite(PIN_RELAY_PUMP_COLLECT, HIGH);
         digitalWrite(PIN_RELAY_MIST,         HIGH);
-        digitalWrite(PIN_RELAY_HEATER,       HIGH);
         digitalWrite(PIN_RELAY_PELTIER,      HIGH);
-        isIntakePumpOn = isCollectPumpOn = isMistOn = isHeaterOn = isPeltierOn = false;
+        isIntakePumpOn = isCollectPumpOn = isMistOn = isPeltierOn = false;
         return;
     }
     // Intake pump — driven by float switch in auto, can be overridden from app
@@ -164,16 +158,6 @@ void updateFastSensors() {
             digitalWrite(PIN_RELAY_MIST, HIGH);
             isMistOn = false;
         }
-    }
-
-    // PTC Heater — auto-only thermostat (not exposed to the API).
-    // ON below 25°C, OFF above 28°C to keep the basin from freezing.
-    if (currentTempC < HEATER_ON_TEMP && !isHeaterOn) {
-        digitalWrite(PIN_RELAY_HEATER, LOW);
-        isHeaterOn = true;
-    } else if (currentTempC >= HEATER_OFF_TEMP && isHeaterOn) {
-        digitalWrite(PIN_RELAY_HEATER, HIGH);
-        isHeaterOn = false;
     }
 
     // Peltier — drives the basin to distillation temperature.
@@ -289,9 +273,6 @@ void setup() {
     pinMode(PIN_RELAY_MIST, OUTPUT);
     digitalWrite(PIN_RELAY_MIST, HIGH);
 
-    pinMode(PIN_RELAY_HEATER, OUTPUT);
-    digitalWrite(PIN_RELAY_HEATER, HIGH); // heater OFF on boot
-
     pinMode(PIN_RELAY_PELTIER, OUTPUT);
     digitalWrite(PIN_RELAY_PELTIER, HIGH); // peltier OFF on boot
 
@@ -335,12 +316,11 @@ void loop() {
     if (now - lastFast >= FAST_INTERVAL) {
         lastFast = now;
         updateFastSensors();
-        Serial.printf("T:%.1f CLEAN:%.1f TDS:%d IN:%s COL:%s MIST:%s HEAT:%s PEL:%s FLOAT:%s SLEEP:%s\n",
+        Serial.printf("T:%.1f CLEAN:%.1f TDS:%d IN:%s COL:%s MIST:%s PEL:%s FLOAT:%s SLEEP:%s\n",
             currentTempC, currentCleanDist, currentTds,
             isIntakePumpOn  ? "ON" : "OFF",
             isCollectPumpOn ? "ON" : "OFF",
             isMistOn        ? "ON" : "OFF",
-            isHeaterOn      ? "ON" : "OFF",
             isPeltierOn     ? "ON" : "OFF",
             floatWaterDetected ? "YES" : "NO",
             isSleeping ? "YES" : "NO");
