@@ -40,11 +40,14 @@ constexpr uint8_t PIN_RELAY_PUMP_INTAKE  = 26; // IN1
 constexpr uint8_t PIN_RELAY_PUMP_COLLECT = 27; // IN2
 constexpr uint8_t PIN_RELAY_MIST         = 25; // IN4 — atomizer/mist
 constexpr uint8_t PIN_RELAY_HEATER       = 32; // IN3 — 12V PTC heater
+constexpr uint8_t PIN_RELAY_PELTIER      = 23; // Peltier module (basin heat-up)
 constexpr uint8_t PIN_FLOAT_SWITCH       = 33;
 
 constexpr float CLEAN_WATER_THRESHOLD = 20.0f;
-constexpr float HEATER_ON_TEMP        = 25.0f; // turn ON below this °C
-constexpr float HEATER_OFF_TEMP       = 28.0f; // turn OFF above this °C
+constexpr float HEATER_ON_TEMP        = 25.0f; // PTC: turn ON below this °C
+constexpr float HEATER_OFF_TEMP       = 28.0f; // PTC: turn OFF above this °C
+constexpr float PELTIER_ON_TEMP       = 30.0f; // Peltier: drive basin toward distillation temp
+constexpr float PELTIER_OFF_TEMP      = 33.0f; // Peltier: stop heating once warm enough
 
 // --- GLOBAL STATE ---
 float currentTempC     = 25.0;
@@ -54,13 +57,15 @@ bool  isIntakePumpOn     = false;
 bool  isCollectPumpOn    = false;
 bool  isMistOn           = false;
 bool  isHeaterOn         = false;
+bool  isPeltierOn        = false;
 bool  floatWaterDetected = false;
 
 // --- OVERRIDE STATE ---
 String overrideIntakePump  = "auto";
 String overrideCollectPump = "auto";
 String overrideMist        = "auto";
-// Heater is auto-only (local thermostat). Not exposed to the API.
+String overridePeltier     = "auto";
+// PTC Heater is auto-only (local thermostat). Not exposed to the API.
 
 // --- SLEEP STATE (from app via response.sleep) ---
 bool isSleeping = false;
@@ -108,13 +113,14 @@ void updateFastSensors() {
     floatWaterDetected = (digitalRead(PIN_FLOAT_SWITCH) == LOW);
 
     // SLEEP MODE: app told the device to power down — kill all relays, skip auto logic.
-    // Heater stays off too (active LOW relay → HIGH = off).
+    // Heater & Peltier stay off too (active LOW relay → HIGH = off).
     if (isSleeping) {
         digitalWrite(PIN_RELAY_PUMP_INTAKE,  HIGH);
         digitalWrite(PIN_RELAY_PUMP_COLLECT, HIGH);
         digitalWrite(PIN_RELAY_MIST,         HIGH);
         digitalWrite(PIN_RELAY_HEATER,       HIGH);
-        isIntakePumpOn = isCollectPumpOn = isMistOn = isHeaterOn = false;
+        digitalWrite(PIN_RELAY_PELTIER,      HIGH);
+        isIntakePumpOn = isCollectPumpOn = isMistOn = isHeaterOn = isPeltierOn = false;
         return;
     }
     // Intake pump — driven by float switch in auto, can be overridden from app
@@ -169,6 +175,24 @@ void updateFastSensors() {
         digitalWrite(PIN_RELAY_HEATER, HIGH);
         isHeaterOn = false;
     }
+
+    // Peltier — drives the basin to distillation temperature.
+    // Auto: ON below 30°C, OFF above 33°C. Can be overridden from the app.
+    if (overridePeltier == "on") {
+        digitalWrite(PIN_RELAY_PELTIER, LOW);
+        isPeltierOn = true;
+    } else if (overridePeltier == "off") {
+        digitalWrite(PIN_RELAY_PELTIER, HIGH);
+        isPeltierOn = false;
+    } else {
+        if (currentTempC < PELTIER_ON_TEMP && !isPeltierOn) {
+            digitalWrite(PIN_RELAY_PELTIER, LOW);
+            isPeltierOn = true;
+        } else if (currentTempC >= PELTIER_OFF_TEMP && isPeltierOn) {
+            digitalWrite(PIN_RELAY_PELTIER, HIGH);
+            isPeltierOn = false;
+        }
+    }
 }
 
 // --- CLOUD SYNC ---
@@ -199,6 +223,9 @@ void syncWithProductionAPI() {
         actuatorsObj["intake_pump_active"]  = isIntakePumpOn;
         actuatorsObj["collect_pump_active"] = isCollectPumpOn;
         actuatorsObj["mist_active"]         = isMistOn;
+        // peltier_active will be stored once a `peltier_active BOOLEAN` column
+        // is added to sensor_readings; until then the server silently drops it.
+        actuatorsObj["peltier_active"]      = isPeltierOn;
 
         // State strings match the WALRUS StatusBadge / deviceStatus vocab.
         // Priority: Sleeping → Distilling (mist) → Collecting → Refilling → Monitoring.
@@ -236,12 +263,15 @@ void syncWithProductionAPI() {
                 overrideCollectPump = resDoc["commands"]["collect_pump_override"].as<String>();
             if (resDoc["commands"]["mist_override"].is<const char*>())
                 overrideMist        = resDoc["commands"]["mist_override"].as<String>();
+            if (resDoc["commands"]["peltier_override"].is<const char*>())
+                overridePeltier     = resDoc["commands"]["peltier_override"].as<String>();
 
-            Serial.printf("[CMD] sleep:%s IN:%s COL:%s MIST:%s\n",
+            Serial.printf("[CMD] sleep:%s IN:%s COL:%s MIST:%s PEL:%s\n",
                 isSleeping ? "ON" : "OFF",
                 overrideIntakePump.c_str(),
                 overrideCollectPump.c_str(),
-                overrideMist.c_str());
+                overrideMist.c_str(),
+                overridePeltier.c_str());
         }
 
         http.end();
@@ -261,6 +291,9 @@ void setup() {
 
     pinMode(PIN_RELAY_HEATER, OUTPUT);
     digitalWrite(PIN_RELAY_HEATER, HIGH); // heater OFF on boot
+
+    pinMode(PIN_RELAY_PELTIER, OUTPUT);
+    digitalWrite(PIN_RELAY_PELTIER, HIGH); // peltier OFF on boot
 
     pinMode(PIN_FLOAT_SWITCH, INPUT_PULLUP);
     pinMode(PIN_ULTRA_TRIG, OUTPUT);
@@ -302,12 +335,13 @@ void loop() {
     if (now - lastFast >= FAST_INTERVAL) {
         lastFast = now;
         updateFastSensors();
-        Serial.printf("T:%.1f CLEAN:%.1f TDS:%d IN:%s COL:%s MIST:%s HEAT:%s FLOAT:%s SLEEP:%s\n",
+        Serial.printf("T:%.1f CLEAN:%.1f TDS:%d IN:%s COL:%s MIST:%s HEAT:%s PEL:%s FLOAT:%s SLEEP:%s\n",
             currentTempC, currentCleanDist, currentTds,
             isIntakePumpOn  ? "ON" : "OFF",
             isCollectPumpOn ? "ON" : "OFF",
             isMistOn        ? "ON" : "OFF",
             isHeaterOn      ? "ON" : "OFF",
+            isPeltierOn     ? "ON" : "OFF",
             floatWaterDetected ? "YES" : "NO",
             isSleeping ? "YES" : "NO");
         syncWithProductionAPI();
