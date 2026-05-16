@@ -129,7 +129,8 @@ void updateFastSensors()
     currentTds = (int)(raw / (1.0f + 0.02f * (currentTempC - 25.0f)));
 
     // Float switch — always read regardless of sleep state
-    floatWaterDetected = (digitalRead(PIN_FLOAT_SWITCH) == LOW);
+    // NC float switch: LOW = no water (switch closed to GND by gravity), HIGH = water (float lifts, switch opens)
+    floatWaterDetected = (digitalRead(PIN_FLOAT_SWITCH) == HIGH);
 
     // SLEEP: time window (18:00–08:00) takes priority; app sleep stacks on top.
     if (isSleeping || isInSleepHours())
@@ -423,13 +424,18 @@ void loop()
         Serial.printf(" IN2 override : %s\n", overrideCollectPump.c_str());
         Serial.printf(" IN3 override : %s\n", overridePeltier.c_str());
         Serial.printf(" App sleep    : %s\n", isSleeping ? "YES" : "NO");
-        Serial.println(" --- ACTUATORS ---");
-        Serial.printf(" IN1 Intake pump  : %s\n", isIntakePumpOn  ? "ON" : "OFF");
-        Serial.printf(" IN2 Collect pump : %s  (cycle: %lus elapsed, %lus until next)\n",
+        Serial.println(" --- ACTUATORS (code state vs raw GPIO) ---");
+        Serial.printf(" IN1 Intake pump  : %s  (GPIO26 raw: %s)\n",
+                      isIntakePumpOn ? "ON" : "OFF",
+                      digitalRead(PIN_RELAY_PUMP_INTAKE) == LOW ? "LOW=ON" : "HIGH=OFF");
+        Serial.printf(" IN2 Collect pump : %s  (GPIO27 raw: %s)  cycle: %lus elapsed, %lus until next\n",
                       isCollectPumpOn ? "ON" : "OFF",
+                      digitalRead(PIN_RELAY_PUMP_COLLECT) == LOW ? "LOW=ON" : "HIGH=OFF",
                       collectElapsed / 1000,
                       collectRemaining);
-        Serial.printf(" IN3 Peltier      : %s\n", isPeltierOn ? "ON" : "OFF");
+        Serial.printf(" IN3 Peltier      : %s  (GPIO32 raw: %s)\n",
+                      isPeltierOn ? "ON" : "OFF",
+                      digitalRead(PIN_RELAY_PELTIER) == LOW ? "LOW=ON" : "HIGH=OFF");
         Serial.println(" --- SYSTEM ---");
         Serial.printf(" SLEEP   : %s\n", sleeping ? "YES (relays OFF)" : "NO (operating)");
         Serial.printf(" PELTIER SCHEDULED: %s\n", peltierShouldRun() ? "YES" : "NO");
