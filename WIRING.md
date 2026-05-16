@@ -6,13 +6,11 @@
 |----------------------------------|-----------|---------------------|
 | DS18B20 (Temperature)            | GPIO 22   | Digital, OneWire    |
 | TDS Sensor Signal                | GPIO 34   | Analog Input        |
-| HC-SR04 TRIG — Clean water level | GPIO 19   | Digital Out         |
-| HC-SR04 ECHO — Clean water level | GPIO 21   | Digital In          |
 | Relay IN1 — Intake Pump          | GPIO 26   | Digital Out         |
 | Relay IN2 — Collection Pump      | GPIO 27   | Digital Out         |
-| Relay IN3 — PTC Heater (12V)     | GPIO 32   | Digital Out         |
+| Relay IN3 — Peltier Module (12V) | GPIO 32   | Digital Out         |
 | Relay IN4 — Atomizer/Mist        | GPIO 25   | Digital Out         |
-| Float Switch                     | GPIO 33   | Digital In (PULLUP) |
+| Float Switch                     | GPIO 14   | Digital In (PULLUP) |
 
 ---
 
@@ -34,7 +32,7 @@
 [Buck Converter]
     IN+  ──► 12V Battery (+)
     IN−  ──► Common GND
-    OUT+ ──► ESP32 VIN, Relay VCC, HC-SR04 VCC, Relay CH3 COM (5V — atomizer)
+    OUT+ ──► ESP32 VIN, Relay VCC, Relay CH3 COM (5V — atomizer)
     OUT− ──► Common GND
 ```
 
@@ -69,42 +67,12 @@ AOUT / Signal   →  ESP32 GPIO 34
 
 ---
 
-## 4. HC-SR04 — Clean Water Output Level
-
-> ECHO outputs 5V — use voltage divider to protect ESP32 (max 3.3V input).
-
-```
-HC-SR04 Pin  →  Connect To
-─────────────────────────────────────────
-VCC          →  Buck converter 5V
-GND          →  Common GND
-TRIG         →  ESP32 GPIO 19
-ECHO         →  Voltage divider (see below) → GPIO 21
-```
-
-### ECHO Voltage Divider (1kΩ + 2kΩ)
-
-```
-ECHO ──[ 1kΩ ]──┬── GPIO 21
-                │
-              [ 2kΩ ]
-                │
-               GND
-```
-
-Result: 5V × (2000 / 3000) = **3.33V** ✅
-
-**Logic:** Distance ≤ 20cm = clean water present → collection pump ON.
-Distance > 20cm = no water → collection pump OFF.
-
----
-
-## 5. Float Switch (2-Wire Ball Float Switch)
+## 4. Float Switch (2-Wire Ball Float Switch)
 
 ```
 Float Switch  →  Connect To
 ─────────────────────────────────────────
-Wire 1        →  ESP32 GPIO 33
+Wire 1        →  ESP32 GPIO 14
 Wire 2        →  Common GND
 
 (No external resistor — firmware uses INPUT_PULLUP)
@@ -115,7 +83,7 @@ HIGH = no water → intake pump ON.
 
 ---
 
-## 6. 4-Channel Relay Module (HW-316)
+## 5. 4-Channel Relay Module (HW-316)
 
 **Input side — connect once:**
 
@@ -126,7 +94,7 @@ VCC           →  Buck converter 5V
 GND           →  Common GND
 IN1           →  ESP32 GPIO 26  (Intake Pump)
 IN2           →  ESP32 GPIO 27  (Collection Pump)
-IN3           →  ESP32 GPIO 32  (PTC Heater)
+IN3           →  ESP32 GPIO 32  (Peltier Module)
 IN4           →  ESP32 GPIO 25  (Atomizer/Mist)
 ```
 
@@ -149,12 +117,12 @@ Relay 2 NO   →  Collection Pump (+) red wire
                  Collection Pump (−) black wire → LOAD− / Common GND
 ```
 
-### Channel 3 — PTC Heater (12V)
+### Channel 3 — Peltier Module (12V)
 
 ```
 Relay 3 COM  →  Solar Controller LOAD+  (12V)
-Relay 3 NO   →  PTC Heater (+) red wire
-                 PTC Heater (−) black wire → LOAD− / Common GND
+Relay 3 NO   →  Peltier (+) red wire
+                 Peltier (−) black wire → LOAD− / Common GND
 ```
 
 ### Channel 4 — Atomizer/Mist Module
@@ -165,17 +133,16 @@ Relay 4 NO   →  Atomizer P1 (+)
                  Atomizer P1 (−) → Common GND
 ```
 
-> PTC is a resistive load — **no flyback diode needed**.
-> Heater turns ON below 25°C, OFF above 28°C (adjustable in code).
+> Peltier is a resistive load — **no flyback diode needed**.
 
 ---
 
-## 7. Atomizer Module (DC 5V — P1 wired)
+## 6. Atomizer Module (DC 5V — P1 wired)
 
 ```
 Atomizer      →  Connect To
 ─────────────────────────────────────────
-P1 (+)        →  Relay CH3 NO (switched 5V)
+P1 (+)        →  Relay CH4 NO (switched 5V)
 P1 (−)        →  Common GND
 Disc output   →  Piezo disc (on-board)
 ```
@@ -185,12 +152,12 @@ Disc output   →  Piezo disc (on-board)
 
 ---
 
-## 8. PTC Heating Element (12V)
+## 7. Peltier Module (12V)
 
 ```
-PTC Heater    →  Connect To
+Peltier       →  Connect To
 ─────────────────────────────────────────
-(+) red       →  Relay CH4 NO
+(+) red       →  Relay CH3 NO
 (−) black     →  Common GND / LOAD−
 ```
 
@@ -198,19 +165,19 @@ PTC Heater    →  Connect To
 
 ---
 
-## 9. Diodes
+## 8. Diodes
 
 | Location | Diode | Status |
 |---|---|---|
 | Across relay coils | Built into HW-316 PCB | ✅ Already there |
 | Across intake pump terminals | 1N4007 | ⚠️ Add this |
 | Across collection pump terminals | 1N4007 | ⚠️ Add this |
-| PTC heater | None needed | ✅ |
+| Peltier module | None needed | ✅ |
 | Atomizer | None needed | ✅ |
 
 ---
 
-## 10. Full System Block Diagram
+## 9. Full System Block Diagram
 
 ```
 [Solar Panel] ──► [Solar Charge Controller] ──► [12V Battery]
@@ -223,15 +190,13 @@ PTC Heater    →  Connect To
                └───┬──────┬──────┬──────┬───────────┘
                GPIO26  GPIO27  GPIO32  GPIO25
                    │      │      │      │
-              [Intake] [Collect] │   [Heater]
-               Pump    Pump    [Atomizer] 12V
-                               5V Module
+              [Intake] [Collect] [Peltier] [Atomizer]
+               Pump    Pump      12V       5V Module
 
 [12V BAT] ──► [Buck 12→5V]
                    ├──► ESP32 VIN
                    ├──► Relay VCC
-                   ├──► HC-SR04 VCC
-                   └──► Relay CH3 COM (atomizer 5V)
+                   └──► Relay CH4 COM (atomizer 5V)
 
 ESP32 3.3V ──► DS18B20 VCC + 4.7kΩ pull-up
            └──► TDS Module VCC
@@ -241,32 +206,32 @@ ESP32 GND  ──► Common GND rail (all components)
 
 ---
 
-## 11. 3.3V vs 5V Reference
+## 10. 3.3V vs 5V Reference
 
 | Component | Powered By |
 |---|---|
 | DS18B20 | ESP32 3.3V |
 | TDS Sensor | ESP32 3.3V |
-| HC-SR04 | Buck converter 5V |
 | Relay VCC | Buck converter 5V |
 | Atomizer (via relay) | Buck converter 5V |
 | ESP32 | Buck converter 5V (via VIN) |
 | Intake Pump | Solar LOAD+ 12V (via relay) |
 | Collection Pump | Solar LOAD+ 12V (via relay) |
-| PTC Heater | Solar LOAD+ 12V (via relay) |
+| Peltier Module | Solar LOAD+ 12V (via relay) |
 
 ---
 
-## 12. Quick-Reference: Troubleshooting
+## 11. Quick-Reference: Troubleshooting
 
 | Symptom | Check |
 |---|---|
 | DS18B20 reads -127°C | Missing 4.7kΩ pull-up resistor on DATA line |
 | DS18B20 always 25.0 | Same as above — default value, sensor not reading |
-| Ultrasonic always 999cm | Voltage divider wiring, sensor obstructed, or no 5V |
-| Intake pump won't stop | Float switch wired wrong — one wire GPIO 33, other GND |
-| Collection pump always OFF | Check HC-SR04 wiring and CLEAN_WATER_THRESHOLD (20cm) in code |
-| Atomizer not running | Confirm 5V on Relay CH3 COM, wired to NO not NC, disc submerged |
-| Heater not turning on | Confirm 12V on Relay CH4 COM, water temp reading correctly |
+| TDS reads 0 | Check AOUT → GPIO 34, VCC → 3.3V, probe submerged |
+| Float always detected | Check switch type (NC vs NO), wire not shorted to GND |
+| Intake pump won't stop | Float switch wired wrong — one wire GPIO 14, other GND |
+| Collection pump always ON | Check app override (COL field in serial), verify NO terminal wiring |
+| Peltier not turning on | Confirm 12V on Relay CH3 COM, check time is within 10:30–15:00 PST |
+| Atomizer not running | Confirm 5V on Relay CH4 COM, wired to NO not NC, disc submerged |
 | Pumps not running | Confirm 12V on Relay CH1/CH2 COM from solar controller LOAD+ |
 | ESP32 not booting | Check buck converter output is exactly 5V, min 500mA |
