@@ -38,24 +38,22 @@ const char *api_key = "walrus-esp32-key-2026";
 const char *device_id = "WALRUS_001";
 const char *backend_url = "https://walrus-pi.vercel.app/api/esp32/data";
 
-// --- TIMING ---
-constexpr unsigned long FAST_INTERVAL = 500;
+// --- TIMING (fixed) ---
 constexpr unsigned long TEMP_INTERVAL = 5000;
 constexpr unsigned long TEMP_WAIT_MS = 800;
 
-// Collection pump: 5 s ON every 30 min
-constexpr unsigned long COLLECT_ON_MS = 5000UL;
-constexpr unsigned long COLLECT_CYCLE_MS = 30UL * 60UL * 1000UL;
-
-// Operating window: 08:00–16:59 PST
-constexpr int WAKE_MIN  = 8 * 60;   // 480 = 08:00
-constexpr int SLEEP_MIN = 17 * 60;  // 1020 = 17:00
-
-// Peltier schedule: 10:30–14:30, 12 min ON / 18 min OFF (30-min cycle)
-constexpr int PELTIER_START_MIN = 10 * 60 + 30; // 630
-constexpr int PELTIER_STOP_MIN  = 14 * 60 + 30; // 870
-constexpr int PELTIER_ON_MIN = 12;
-constexpr int PELTIER_CYCLE_MIN = 30;
+// --- RUNTIME CONFIG (overridden by app via POST response) ---
+// Defaults match the original hardcoded constants. The app can change these
+// live; firmware reads them from `config` in the POST response each sync.
+unsigned long fastIntervalMs    = 500;
+unsigned long collectOnMs       = 5000UL;
+unsigned long collectCycleMs    = 30UL * 60UL * 1000UL;
+int wakeMin                     = 8 * 60;       // 480 = 08:00
+int sleepMin                    = 17 * 60;      // 1020 = 17:00
+int peltierStartMin             = 10 * 60 + 30; // 630
+int peltierStopMin              = 14 * 60 + 30; // 870
+int peltierOnMin                = 12;
+int peltierCycleMin             = 30;
 
 // --- PIN DEFINITIONS ---
 constexpr uint8_t PIN_DS18B20 = 22;
@@ -100,10 +98,10 @@ bool isInSleepHours()
     if (!getLocalTime(&timeinfo))
         return false;
     int totalMin = timeinfo.tm_hour * 60 + timeinfo.tm_min;
-    return (totalMin < WAKE_MIN || totalMin >= SLEEP_MIN);
+    return (totalMin < wakeMin || totalMin >= sleepMin);
 }
 
-// True when the peltier should be in its ON phase (10:30–14:30, 12/18-min cycle).
+// True when the peltier should be in its ON phase (configurable window + cycle).
 // Returns false outside the operating window or if NTP has not synced.
 bool peltierShouldRun()
 {
@@ -111,10 +109,10 @@ bool peltierShouldRun()
     if (!getLocalTime(&timeinfo))
         return false;
     int totalMin = timeinfo.tm_hour * 60 + timeinfo.tm_min;
-    if (totalMin < PELTIER_START_MIN || totalMin >= PELTIER_STOP_MIN)
+    if (totalMin < peltierStartMin || totalMin >= peltierStopMin)
         return false;
-    int cycleMin = (totalMin - PELTIER_START_MIN) % PELTIER_CYCLE_MIN;
-    return cycleMin < PELTIER_ON_MIN;
+    int cycleMin = (totalMin - peltierStartMin) % peltierCycleMin;
+    return cycleMin < peltierOnMin;
 }
 
 // --- FAST SENSORS & ACTUATOR CONTROL ---
@@ -201,11 +199,11 @@ void updateFastSensors()
         isIntakePumpOn = on;
     }
 
-    // Collection pump — 5 s ON every 30 min; override from app.
+    // Collection pump — configurable cycle/duration; override from app.
     unsigned long collectElapsed = now - collectCycleStart;
-    if (collectElapsed >= COLLECT_CYCLE_MS)
+    if (collectElapsed >= collectCycleMs)
         collectCycleStart = now;
-    bool autoCollect = (collectElapsed < COLLECT_ON_MS);
+    bool autoCollect = (collectElapsed < collectOnMs);
 
     if (overrideCollectPump == "on")
     {
@@ -303,11 +301,30 @@ void syncWithProductionAPI()
             if (resDoc["commands"]["peltier_override"].is<const char *>())
                 overridePeltier = resDoc["commands"]["peltier_override"].as<String>();
 
+            // Runtime config — schedule + durations. Defaults preserved if absent.
+            JsonVariantConst cfg = resDoc["config"];
+            if (cfg.is<JsonObject>())
+            {
+                if (cfg["wake_minute"].is<int>())              wakeMin         = cfg["wake_minute"].as<int>();
+                if (cfg["sleep_minute"].is<int>())             sleepMin        = cfg["sleep_minute"].as<int>();
+                if (cfg["peltier_start_minute"].is<int>())     peltierStartMin = cfg["peltier_start_minute"].as<int>();
+                if (cfg["peltier_stop_minute"].is<int>())      peltierStopMin  = cfg["peltier_stop_minute"].as<int>();
+                if (cfg["peltier_on_minutes"].is<int>())       peltierOnMin    = cfg["peltier_on_minutes"].as<int>();
+                if (cfg["peltier_cycle_minutes"].is<int>())    peltierCycleMin = cfg["peltier_cycle_minutes"].as<int>();
+                if (cfg["collect_cycle_minutes"].is<int>())    collectCycleMs  = (unsigned long)cfg["collect_cycle_minutes"].as<int>() * 60UL * 1000UL;
+                if (cfg["collect_duration_seconds"].is<int>()) collectOnMs     = (unsigned long)cfg["collect_duration_seconds"].as<int>() * 1000UL;
+                if (cfg["sync_interval_ms"].is<int>())         fastIntervalMs  = (unsigned long)cfg["sync_interval_ms"].as<int>();
+            }
+
             Serial.printf("[CMD] app_sleep:%s  IN1:%s  IN2:%s  IN3:%s\n",
                           isSleeping ? "ON" : "OFF",
                           overrideIntakePump.c_str(),
                           overrideCollectPump.c_str(),
                           overridePeltier.c_str());
+            Serial.printf("[CFG] wake:%d sleep:%d  pel:%d-%d (%d on / %d cycle)  collect:%lums/%lums  sync:%lums\n",
+                          wakeMin, sleepMin, peltierStartMin, peltierStopMin,
+                          peltierOnMin, peltierCycleMin,
+                          collectOnMs, collectCycleMs, fastIntervalMs);
         }
         else
         {
@@ -383,9 +400,9 @@ void loop()
         tempRequested = false;
     }
 
-    // Fast sensors, actuators, API sync — every 500 ms
+    // Fast sensors, actuators, API sync — interval is runtime-configurable
     static unsigned long lastFast = 0;
-    if (now - lastFast >= FAST_INTERVAL)
+    if (now - lastFast >= fastIntervalMs)
     {
         lastFast = now;
         updateFastSensors();
@@ -393,8 +410,8 @@ void loop()
         bool sleeping = isSleeping || isInSleepHours();
 
         unsigned long collectElapsed = now - collectCycleStart;
-        unsigned long collectRemaining = (collectElapsed < COLLECT_CYCLE_MS)
-                                             ? (COLLECT_CYCLE_MS - collectElapsed) / 1000
+        unsigned long collectRemaining = (collectElapsed < collectCycleMs)
+                                             ? (collectCycleMs - collectElapsed) / 1000
                                              : 0;
 
         struct tm timeinfo;
