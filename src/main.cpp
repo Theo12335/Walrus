@@ -5,18 +5,18 @@
  * Data Flow: ESP32 -> Vercel API (HTTPS) -> Supabase
  * Timezone: Philippines Standard Time (UTC+8, no DST)
  *
- * Operating window: 08:01–17:59 (PST)
- * Sleep window:     18:00–08:00 — all relays OFF, sensors still read
+ * Operating window: 08:00–16:59 (PST)
+ * Sleep window:     17:00–07:59 — all relays OFF, sensors still read
  *
  * Sensors (data only):
- *   DS18B20    — basin temperature
- *   TDS        — water quality
- *   Float switch — water presence in basin
+ *   DS18B20      — basin temperature
+ *   TDS          — water quality
+ *   Float switch — water presence in basin (NO type, closes to GND when water)
  *
  * Actuators:
  *   Intake pump  — ON when float switch detects no water, OFF when water present
  *   Collect pump — 5 s ON every 30 min (suspended while peltier is active)
- *   Peltier      — 10:30–15:00, 12 min ON / 18 min OFF cycle
+ *   Peltier      — 10:30–14:30, 12 min ON / 18 min OFF cycle
  *                  When peltier activates: all other relays go OFF.
  *                  If basin is empty, intake pump fills it before peltier fires.
  * =============================================================================
@@ -32,8 +32,8 @@
 #include <time.h>
 
 // --- WiFi & API CONFIG ---
-const char *ssid = "Theo";
-const char *password = "wassuppp";
+const char *ssid = "Wassup2.4G";
+const char *password = "Bascon12335";
 const char *api_key = "walrus-esp32-key-2026";
 const char *device_id = "WALRUS_001";
 const char *backend_url = "https://walrus-pi.vercel.app/api/esp32/data";
@@ -47,13 +47,13 @@ constexpr unsigned long TEMP_WAIT_MS = 800;
 constexpr unsigned long COLLECT_ON_MS = 5000UL;
 constexpr unsigned long COLLECT_CYCLE_MS = 30UL * 60UL * 1000UL;
 
-// Operating window: 08:01–17:59 PST
-constexpr int WAKE_MIN = 8 * 60 + 1; // 481
-constexpr int SLEEP_MIN = 18 * 60;   // 1080
+// Operating window: 08:00–16:59 PST
+constexpr int WAKE_MIN  = 8 * 60;   // 480 = 08:00
+constexpr int SLEEP_MIN = 17 * 60;  // 1020 = 17:00
 
-// Peltier schedule: 10:30–15:00, 12 min ON / 18 min OFF (30-min cycle)
-constexpr int PELTIER_START_MIN = 10 * 60 + 30;
-constexpr int PELTIER_STOP_MIN = 15 * 60;
+// Peltier schedule: 10:30–14:30, 12 min ON / 18 min OFF (30-min cycle)
+constexpr int PELTIER_START_MIN = 10 * 60 + 30; // 630
+constexpr int PELTIER_STOP_MIN  = 14 * 60 + 30; // 870
 constexpr int PELTIER_ON_MIN = 12;
 constexpr int PELTIER_CYCLE_MIN = 30;
 
@@ -63,7 +63,7 @@ constexpr uint8_t PIN_TDS_ANALOG = 34;
 constexpr uint8_t PIN_RELAY_PUMP_INTAKE = 26;  // IN1
 constexpr uint8_t PIN_RELAY_PUMP_COLLECT = 27; // IN2
 constexpr uint8_t PIN_RELAY_PELTIER = 32;      // IN3
-constexpr uint8_t PIN_FLOAT_SWITCH = 14;
+constexpr uint8_t PIN_FLOAT_SWITCH = 33;
 
 // --- GLOBAL STATE ---
 float currentTempC = 25.0;
@@ -92,7 +92,7 @@ unsigned long collectCycleStart = 0;
 OneWire oneWire(PIN_DS18B20);
 DallasTemperature sensors(&oneWire);
 
-// True during the system sleep window (18:00–08:00 PST).
+// True during the system sleep window (17:00–08:00 PST).
 // Returns false if NTP has not synced yet (safe default: stay awake).
 bool isInSleepHours()
 {
@@ -103,7 +103,7 @@ bool isInSleepHours()
     return (totalMin < WAKE_MIN || totalMin >= SLEEP_MIN);
 }
 
-// True when the peltier should be in its ON phase (10:30–15:00, 12/18-min cycle).
+// True when the peltier should be in its ON phase (10:30–14:30, 12/18-min cycle).
 // Returns false outside the operating window or if NTP has not synced.
 bool peltierShouldRun()
 {
@@ -128,24 +128,21 @@ void updateFastSensors()
     float raw = (133.42f * pow(v, 3) - 255.86f * pow(v, 2) + 857.39f * v) * 0.5f;
     currentTds = (int)(raw / (1.0f + 0.02f * (currentTempC - 25.0f)));
 
-    // Float switch — always read regardless of sleep state
-    // NC float switch: LOW = no water (switch closed to GND by gravity), HIGH = water (float lifts, switch opens)
-    floatWaterDetected = (digitalRead(PIN_FLOAT_SWITCH) == HIGH);
+    // Float switch — NO type: LOW = switch closed = water present
+    floatWaterDetected = (digitalRead(PIN_FLOAT_SWITCH) == LOW);
 
-    // SLEEP: time window (18:00–08:00) takes priority; app sleep stacks on top.
+    // SLEEP: time window (17:00–08:00) takes priority; app sleep stacks on top.
     if (isSleeping || isInSleepHours())
     {
         digitalWrite(PIN_RELAY_PUMP_INTAKE, HIGH);
         digitalWrite(PIN_RELAY_PUMP_COLLECT, HIGH);
         digitalWrite(PIN_RELAY_PELTIER, HIGH);
         isIntakePumpOn = isCollectPumpOn = isPeltierOn = false;
-        // Keep collect cycle reset so it fires promptly when the system wakes.
         collectCycleStart = now;
         return;
     }
 
     // --- PELTIER PRIORITY ---
-    // Override from app takes precedence; otherwise follow the schedule.
     bool peltierWantsOn;
     if (overridePeltier == "on")
         peltierWantsOn = true;
@@ -177,7 +174,6 @@ void updateFastSensors()
             isPeltierOn = true;
         }
 
-        // Reset collect cycle so it doesn't fire the instant peltier ends.
         collectCycleStart = now;
         return;
     }
@@ -199,6 +195,7 @@ void updateFastSensors()
     }
     else
     {
+        // LOW = water present → pump OFF. HIGH = no water → pump ON.
         bool on = !floatWaterDetected;
         digitalWrite(PIN_RELAY_PUMP_INTAKE, on ? LOW : HIGH);
         isIntakePumpOn = on;
@@ -259,7 +256,6 @@ void syncWithProductionAPI()
 
         bool sleeping = isSleeping || isInSleepHours();
 
-        // State priority: Sleeping → Heating → Filling (pre-heat) → Collecting → Refilling → Monitoring
         if (sleeping)
             doc["state"] = "Sleeping";
         else if (isPeltierOn)
@@ -290,8 +286,6 @@ void syncWithProductionAPI()
                 Serial.println("WARNING: Check X-API-Key!");
         }
 
-        // Parse override commands from app response.
-        // Time-based sleep cannot be cancelled by the app.
         String responseBody = http.getString();
         Serial.println("[API] Raw response:");
         Serial.println(responseBody);
@@ -398,13 +392,11 @@ void loop()
 
         bool sleeping = isSleeping || isInSleepHours();
 
-        // Collect pump cycle progress
         unsigned long collectElapsed = now - collectCycleStart;
         unsigned long collectRemaining = (collectElapsed < COLLECT_CYCLE_MS)
-                                            ? (COLLECT_CYCLE_MS - collectElapsed) / 1000
-                                            : 0;
+                                             ? (COLLECT_CYCLE_MS - collectElapsed) / 1000
+                                             : 0;
 
-        // Current local time
         struct tm timeinfo;
         char timeBuf[10] = "??:??:??";
         if (getLocalTime(&timeinfo))
@@ -415,8 +407,8 @@ void loop()
         Serial.printf(" WIFI    : %s\n", WiFi.status() == WL_CONNECTED ? "CONNECTED" : "DISCONNECTED");
         Serial.println(" --- SENSORS ---");
         Serial.printf(" TEMP    : %.1f C\n", currentTempC);
-        Serial.printf(" TDS     : %d ppm  (raw ADC: %u)\n", currentTds, analogRead(PIN_TDS_ANALOG));
-        Serial.printf(" FLOAT   : %s  (GPIO14 raw: %s)\n",
+        Serial.printf(" TDS     : %d ppm\n", currentTds);
+        Serial.printf(" FLOAT   : %s  (GPIO33 raw: %s)\n",
                       floatWaterDetected ? "WATER DETECTED" : "NO WATER",
                       digitalRead(PIN_FLOAT_SWITCH) == LOW ? "LOW" : "HIGH");
         Serial.println(" --- OVERRIDES (from app) ---");
@@ -424,20 +416,20 @@ void loop()
         Serial.printf(" IN2 override : %s\n", overrideCollectPump.c_str());
         Serial.printf(" IN3 override : %s\n", overridePeltier.c_str());
         Serial.printf(" App sleep    : %s\n", isSleeping ? "YES" : "NO");
-        Serial.println(" --- ACTUATORS (code state vs raw GPIO) ---");
-        Serial.printf(" IN1 Intake pump  : %s  (GPIO26 raw: %s)\n",
+        Serial.println(" --- ACTUATORS (code vs raw GPIO) ---");
+        Serial.printf(" IN1 Intake pump  : %s  (GPIO26: %s)\n",
                       isIntakePumpOn ? "ON" : "OFF",
                       digitalRead(PIN_RELAY_PUMP_INTAKE) == LOW ? "LOW=ON" : "HIGH=OFF");
-        Serial.printf(" IN2 Collect pump : %s  (GPIO27 raw: %s)  cycle: %lus elapsed, %lus until next\n",
+        Serial.printf(" IN2 Collect pump : %s  (GPIO27: %s)  cycle: %lus elapsed, %lus until next\n",
                       isCollectPumpOn ? "ON" : "OFF",
                       digitalRead(PIN_RELAY_PUMP_COLLECT) == LOW ? "LOW=ON" : "HIGH=OFF",
                       collectElapsed / 1000,
                       collectRemaining);
-        Serial.printf(" IN3 Peltier      : %s  (GPIO32 raw: %s)\n",
+        Serial.printf(" IN3 Peltier      : %s  (GPIO32: %s)\n",
                       isPeltierOn ? "ON" : "OFF",
                       digitalRead(PIN_RELAY_PELTIER) == LOW ? "LOW=ON" : "HIGH=OFF");
         Serial.println(" --- SYSTEM ---");
-        Serial.printf(" SLEEP   : %s\n", sleeping ? "YES (relays OFF)" : "NO (operating)");
+        Serial.printf(" SLEEP            : %s\n", sleeping ? "YES (relays OFF)" : "NO (operating)");
         Serial.printf(" PELTIER SCHEDULED: %s\n", peltierShouldRun() ? "YES" : "NO");
         Serial.println("─────────────────────────────────────────");
 

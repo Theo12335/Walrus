@@ -10,7 +10,7 @@
 | Relay IN2 — Collection Pump      | GPIO 27   | Digital Out         |
 | Relay IN3 — Peltier Module (12V) | GPIO 32   | Digital Out         |
 | Relay IN4 — Atomizer/Mist        | GPIO 25   | Digital Out         |
-| Float Switch                     | GPIO 14   | Digital In (PULLUP) |
+| Float Switch                     | GPIO 33   | Digital In (PULLUP) |
 
 ---
 
@@ -72,7 +72,7 @@ AOUT / Signal   →  ESP32 GPIO 34
 ```
 Float Switch  →  Connect To
 ─────────────────────────────────────────
-Wire 1        →  ESP32 GPIO 14
+Wire 1        →  ESP32 GPIO 33
 Wire 2        →  Common GND
 
 (No external resistor — firmware uses INPUT_PULLUP)
@@ -229,7 +229,7 @@ ESP32 GND  ──► Common GND rail (all components)
 | DS18B20 always 25.0 | Same as above — default value, sensor not reading |
 | TDS reads 0 | Check AOUT → GPIO 34, VCC → 3.3V, probe submerged |
 | Float always detected | Check switch type (NC vs NO), wire not shorted to GND |
-| Intake pump won't stop | Float switch wired wrong — one wire GPIO 14, other GND |
+| Intake pump won't stop | Float switch wired wrong — one wire GPIO 33, other GND |
 | Collection pump always ON | Check app override (COL field in serial), verify NO terminal wiring |
 | Peltier not turning on | Confirm 12V on Relay CH3 COM, check time is within 10:30–15:00 PST |
 | Atomizer not running | Confirm 5V on Relay CH4 COM, wired to NO not NC, disc submerged |
