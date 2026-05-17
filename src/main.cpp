@@ -383,6 +383,15 @@ void loop()
         tempRequested = false;
     }
 
+    // WiFi reconnect — non-blocking, retries every 10 s when disconnected
+    static unsigned long lastWifiRetry = 0;
+    if (WiFi.status() != WL_CONNECTED && now - lastWifiRetry >= 10000UL)
+    {
+        lastWifiRetry = now;
+        WiFi.reconnect();
+        Serial.println("[WIFI] Disconnected — attempting reconnect...");
+    }
+
     // Fast sensors, actuators, API sync — every 500 ms
     static unsigned long lastFast = 0;
     if (now - lastFast >= FAST_INTERVAL)
